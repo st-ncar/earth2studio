@@ -371,7 +371,8 @@ class GraphCastOperational(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         """
 
         # Create copies to avoid mutating inputs.
-        inputs = xr.Dataset(inputs)
+        if not isinstance(inputs, xr.Dataset):
+            inputs = xr.Dataset(inputs)
         targets_template = xr.Dataset(targets_template)
         forcings = xr.Dataset(forcings)
 
