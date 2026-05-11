@@ -210,8 +210,8 @@ class WPSBackend(IOBackend):
         ds = xr.Dataset(data_vars, coords=coords)
 
         logger.info("Adding static fields.")
-        z = SurfaceGeoPotential(cache=False)([0])
-        lsm = LandSeaMask(cache=False)([0])
+        z = SurfaceGeoPotential()([pd.Timestamp(0)])
+        lsm = LandSeaMask()([pd.Timestamp(0)])
         ds["z"] = z.squeeze().expand_dims(time=ds.time)  # divide by g later
         ds["lsm"] = lsm.squeeze().expand_dims(time=ds.time)
 
