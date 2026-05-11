@@ -375,7 +375,11 @@ class MPASHybrid(_MPASBase):
                 raise ValueError(f"Unexpected interp_type {interp_type}")
 
             # TODO: quadratic interpolation as in FULL-POS CY46T1R1 https://www.umr-cnrm.fr/gmapdoc/IMG/pdf/ykfpos46t1r1.pdf
-            return np.interp(interp_target_x, interp_x, data, left=np.nan, right=np.nan)
+            # Extrapolation:
+            # - left: extrapolation at model top. Assign last data value (default)
+            # - right: extrapolation at / below surface. Label as nan for further processing.
+            # return np.interp(interp_target_x, interp_x, data, left=np.nan, right=np.nan)
+            return np.interp(interp_target_x, interp_x, data, right=np.nan)
 
         vars_to_interp = {
             self.lexicon.get_derived_name(v)
