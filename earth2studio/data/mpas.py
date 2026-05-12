@@ -374,13 +374,107 @@ class MPASHybrid(_MPASBase):
             elif interp_type != "linear":
                 raise ValueError(f"Unexpected interp_type {interp_type}")
 
-            # TODO: quadratic interpolation as in FULL-POS CY46T1R1 https://www.umr-cnrm.fr/gmapdoc/IMG/pdf/ykfpos46t1r1.pdf
             return np.interp(interp_target_x, interp_x, data, left=np.nan, right=np.nan)
+
+        def vectorized_top_fill(
+            data: np.ndarray,
+            pressure: np.ndarray,
+            targets: np.ndarray,
+            strategy: str,
+        ) -> np.ndarray:
+            """
+            Based on Yessad K.'s FULL-POS IN THE CYCLE 46T1R1 OF ARPEGE/IFS
+            https://www.umr-cnrm.fr/gmapdoc/IMG/pdf/ykfpos46t1r1.pdf
+            Fill values above model top using variable-specific strategies.
+            Returns NaN for levels that are not above model top.
+            """
+            data_values = np.asarray(data, dtype=np.float64)
+            pressure_values = np.asarray(pressure, dtype=np.float64)
+            target_values = np.asarray(targets, dtype=np.float64)
+
+            out = np.full(target_values.shape, np.nan, dtype=np.float64)
+            if data_values.size < 2 or pressure_values.size < 2:
+                return out
+
+            # Ensure ascending pressure (top of model at index 0)
+            if pressure_values[0] > pressure_values[-1]:
+                pressure_values = pressure_values[::-1]
+                data_values = data_values[::-1]
+
+            p1, p2 = pressure_values[0], pressure_values[1]
+            v1, v2 = data_values[0], data_values[1]
+            if not np.isfinite([p1, p2, v1, v2]).all() or p1 <= 0 or p2 <= 0:
+                return out
+
+            above_top = (target_values > 0) & (target_values < p1)
+            if not np.any(above_top):
+                return out
+
+            x_target = np.log(
+                np.clip(target_values[above_top], np.finfo(float).tiny, None)
+            )
+            x1 = np.log(p1)
+            x2 = np.log(p2)
+            # Use a small positive pressure to represent p=0 in log-pressure space.
+            p_top = max(np.finfo(float).tiny, min(1.0, 0.5 * p1))
+            x0 = np.log(p_top)
+
+            if strategy == "wind":
+                # Quadratic (top value linear from p1/p2)
+                v_top = v1 + (v1 - v2) * (0.0 - p1) / (p1 - p2)
+                coeffs = np.polyfit([x0, x1, x2], [v_top, v1, v2], deg=2)
+                out[above_top] = np.polyval(coeffs, x_target)
+            elif strategy == "omega":
+                # Enforce omega -> 0 at p=0 with a linear profile in pressure.
+                out[above_top] = v1 * (target_values[above_top] / p1)
+            elif strategy == "temperature":
+                # Enforce T_top = T_layer1; quadratic fit through (top, layer1, layer2).
+                coeffs = np.polyfit([x0, x1, x2], [v1, v1, v2], deg=2)
+                out[above_top] = np.polyval(coeffs, x_target)
+            elif strategy == "geopotential":
+                # Interpolate departure from a simple standard-atmosphere geopotential profile.
+                rd = float(getattr(dry_air_gas_constant, "m", dry_air_gas_constant))
+                t_std = 255.0
+                p0_std = 101325.0
+
+                def standard_geopotential(p: np.ndarray | float) -> np.ndarray:
+                    p_arr = np.asarray(p, dtype=np.float64)
+                    return (
+                        -rd
+                        * t_std
+                        * np.log(np.clip(p_arr, np.finfo(float).tiny, None) / p0_std)
+                    )
+
+                phi_std_1 = standard_geopotential(p1)
+                phi_std_2 = standard_geopotential(p2)
+                e1 = v1 - phi_std_1
+                e2 = v2 - phi_std_2
+                if np.isclose(p1, p2):
+                    e_top = e1
+                else:
+                    e_top = e1 + (e1 - e2) * (0.0 - p1) / (p1 - p2)
+
+                coeffs = np.polyfit([x0, x1, x2], [e_top, e1, e2], deg=2)
+                departure = np.polyval(coeffs, x_target)
+                out[above_top] = departure + standard_geopotential(
+                    target_values[above_top]
+                )
+            elif strategy == "humidity":
+                out[above_top] = v1
+            else:
+                raise ValueError(f"Unexpected top-fill strategy {strategy}")
+
+            return out
 
         vars_to_interp = {
             self.lexicon.get_derived_name(v)
             for v in requested_variables
             if self.lexicon.is_3d_variable(v)
+        }
+        moisture_vars_to_interp = {
+            self.lexicon.get_derived_name(v)
+            for v in requested_variables
+            if self.lexicon.is_3d_variable(v) and re.sub(r"\d+$", "", v) in {"q", "r"}
         }
 
         # Create a 1D DataArray for target pressure levels
@@ -439,6 +533,44 @@ class MPASHybrid(_MPASBase):
 
                 # 2. Get mask of all pts that need filling.
                 nan_mask = interp_da.isnull()
+                top_pressure = pressure_field.min(dim=vert_dim)
+                bottom_pressure = pressure_field.max(dim=vert_dim)
+                above_top_mask = nan_mask & (target_levels_pa_da < top_pressure)
+                below_surface_mask = nan_mask & (target_levels_pa_da > bottom_pressure)
+
+                is_wind = name in {"uReconstructMeridional", "uReconstructZonal"}
+                is_humidity = name in moisture_vars_to_interp
+
+                # Apply variable-specific top-of-model fill before below-ground handling.
+                top_strategy = None
+                if is_wind:
+                    top_strategy = "wind"
+                elif name == "pressure_vertical_velocity":
+                    top_strategy = "omega"
+                elif name == "geopotential":
+                    top_strategy = "geopotential"
+                elif name == "temperature":
+                    top_strategy = "temperature"
+                elif is_humidity:
+                    top_strategy = "humidity"
+
+                if top_strategy is not None:
+                    top_fill_nocoords = xr.apply_ufunc(
+                        vectorized_top_fill,
+                        da,
+                        pressure_field,
+                        target_levels_pa_da,
+                        kwargs={"strategy": top_strategy},
+                        input_core_dims=[[vert_dim], [vert_dim], ["level"]],
+                        output_core_dims=[["level"]],
+                        exclude_dims={vert_dim, "level"},
+                        vectorize=True,
+                        output_dtypes=[da.dtype],
+                    )
+                    top_fill_da = top_fill_nocoords.assign_coords(
+                        level=target_levels_pa_da.level
+                    )
+                    interp_da = xr.where(above_top_mask, top_fill_da, interp_da)
 
                 surface_pressure = ds["surface_pressure"]
 
@@ -499,9 +631,9 @@ class MPASHybrid(_MPASBase):
                     y = alpha * ln_pressure_ratio
                     extrap_values = surface_temperature * (1 + y + y**2 / 2 + y**3 / 6)
 
-                    # Final Merge
+                    # Final Merge (below-ground only)
                     final_da = xr.where(
-                        nan_mask, extrap_values.metpy.dequantify(), interp_da
+                        below_surface_mask, extrap_values.metpy.dequantify(), interp_da
                     )
 
                 elif name == "geopotential":
@@ -551,15 +683,15 @@ class MPASHybrid(_MPASBase):
                         * (1 + y / 2 + y**2 / 6)
                     )
                     final_da = xr.where(
-                        nan_mask, extrap_values.metpy.dequantify(), interp_da
+                        below_surface_mask, extrap_values.metpy.dequantify(), interp_da
                     )
 
                 else:
-                    # For all other variables, fill NaNs by persisting surface value
+                    # For all other variables, fill below-ground by persisting surface value
                     surface_value = da.isel(
                         {vert_dim: lowest_model_level}
                     ).metpy.dequantify()
-                    final_da = interp_da.fillna(surface_value)
+                    final_da = xr.where(below_surface_mask, surface_value, interp_da)
 
                 interpolated_vars[name] = final_da
 
