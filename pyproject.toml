@@ -180,7 +180,7 @@ gencast = [
 graphcast = [
     "graphcast",
     "dm-haiku>=0.0.14",
-    "jax[cuda13]>=0.4.26",
+    "jax[cuda12]>=0.4.26",
     "flax>=0.10.6",
     "dm-tree>=0.1.9",
 ]
