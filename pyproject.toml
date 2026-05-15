@@ -309,8 +309,6 @@ torch-harmonics = [
   { git = "https://github.com/NVIDIA/torch-harmonics.git", rev = "a632ca748a12bd9f74dbc1e00653317810991f74", extra = "fcn3"},
   { git = "https://github.com/NVIDIA/torch-harmonics.git", rev = "a632ca748a12bd9f74dbc1e00653317810991f74", extra = "sfno"},
 ]
-
-[tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
